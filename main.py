@@ -33,7 +33,6 @@ def write_tickers_sheet(gc, tickers):
     ws = gc.open(SHEET_NAME).worksheet(TICKERS_TAB)
     ws.clear()
     ws.append_row(["Ticker"])
-    # batch
     rows = [[t] for t in tickers]
     batch = 1000
     for i in range(0, len(rows), batch):
@@ -94,10 +93,10 @@ def fetch_all_polygon_tickers():
 def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
     """
     One request per ticker: daily aggregates over last N calendar days (adjusted).
-    Returns pandas DataFrame with columns: t (ms), o, h, l, c, v
+    Returns pandas DataFrame with columns: timestamp, open, high, low, close, volume
     """
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days*2)  # give extra room for weekends/holidays
+    start = end - timedelta(days=days*2)  # extra room for weekends/holidays
     url = f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
     params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}
     try:
@@ -107,9 +106,7 @@ def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
         if not results:
             return None
         df = pd.DataFrame(results)
-        # standardize columns
         df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
-        # keep last N trading days
         df = df.tail(days).reset_index(drop=True)
         return df
     except Exception:
@@ -148,6 +145,10 @@ def analyze_one(ticker):
     if df is None or df.shape[0] < 50:
         return None  # not enough bars
 
+    # NEW: skip symbols with no trading on the latest bar
+    if "volume" not in df.columns or float(df["volume"].iloc[-1]) <= 0:
+        return None
+
     close = df["close"]
     price = float(close.iloc[-1])
 
@@ -158,7 +159,7 @@ def analyze_one(ticker):
     macd_v = float(macd_line.iloc[-1])
     signal_v = float(signal_line.iloc[-1])
 
-    # Buy rule (your current slightly-looser criteria):
+    # Buy rule (current slightly-looser criteria)
     is_bullish = (
         (25 < rsi14 < 65) and
         (macd_v > signal_v) and
@@ -176,7 +177,7 @@ def analyze_one(ticker):
 
     buy_reason = ""
     if is_bullish:
-        buy_reason = "RSI 25-65, MACD crossover, Vol>0, Price>EMA20 or RSI<45"
+        buy_reason = "RSI 25-65, MACD crossover, Price>EMA20 or RSI<45"
     elif not math.isnan(rsi14) or not math.isnan(macd_v):
         buy_reason = "Not all slightly-looser criteria met"
 
@@ -193,6 +194,7 @@ def analyze_one(ticker):
         round(rank_score, 3),
         ""  # TopPick placeholder
     ]
+
     # Filter out missing or zero values
     if any(v in (None, "", 0, 0.0) for v in row[1:6]):
         return None
