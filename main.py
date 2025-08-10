@@ -1,227 +1,312 @@
 import os
 import json
 import time
+import math
 import requests
 import gspread
-import numpy as np
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, timezone
-from ta.trend import EMAIndicator, SMAIndicator, MACD
-from ta.momentum import RSIIndicator
 
-# ===== CONFIG =====
+# =========================
+# Config (env or defaults)
+# =========================
 SHEET_NAME   = os.getenv("SHEET_NAME", "Trading Log")
 TICKERS_TAB  = os.getenv("TICKERS_TAB", "tickers")
 SCREENER_TAB = os.getenv("SCREENER_TAB", "screener")
 
-POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-if not POLYGON_API_KEY or not GOOGLE_CREDS_JSON:
-    raise RuntimeError("Missing POLYGON_API_KEY or GOOGLE_CREDS_JSON")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY") or os.getenv("API_KEY")
+if not POLYGON_API_KEY:
+    raise RuntimeError("Missing POLYGON_API_KEY env var.")
 
-# Universe filters
-ALLOWED_EXCHANGES = {"XNYS", "XNAS", "XASE", "ARCX", "BATS"}  # NYSE, NASDAQ, AMEX, ARCA, Cboe
-ALLOWED_TYPES     = {"CS", "ADRC", "ADRP", "ADRR"}            # Common + ADR variants
+# Prefilter knobs (cheap, via grouped bars + metadata)
+MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "300000"))         # yesterday's raw shares
+MIN_PRICE     = float(os.getenv("MIN_PRICE", "2.0"))
+ALLOWED_EXCHANGES = set(os.getenv("ALLOWED_EXCHANGES", "XNYS,XNAS,XASE,ARCX,BATS").split(","))
+INCLUDE_TYPES = set(os.getenv("INCLUDE_TYPES", "CS,ADRC,ADRP,ADRR").split(","))  # common & ADRs
+EXCLUDE_TYPES = set(os.getenv("EXCLUDE_TYPES", "ETF,ETN,FUND,SP,PFD,WRT,RIGHT,UNIT,REIT").split(","))
 
-# Screener knobs
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "20000"))  # cap for analysis
-MIN_PRICE   = float(os.getenv("MIN_PRICE", "5"))      # basic price floor
-MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "500000"))  # avg shares (20d) in analysis stage
+# Analysis caps & pacing
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))
+DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "200"))
+SLEEP_MS_BETWEEN_CALLS = int(os.getenv("SLEEP_MS_BETWEEN_CALLS", "50"))
 
-# Buy rules (rolled-back MACD; still stricter trend)
+# BUY criteria (keep your existing defaults)
 RSI_MIN = float(os.getenv("RSI_MIN", "52"))
 RSI_MAX = float(os.getenv("RSI_MAX", "60"))
-MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.05"))  # 5%
+MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.05"))  # 5% cap
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
 
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.05"))  # seconds between HTTP calls
-
-# ===== HELPERS =====
+# =========================
+# Google Sheets helpers
+# =========================
 def get_google_client():
-    creds = json.loads(GOOGLE_CREDS_JSON)
+    creds = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
     return gspread.service_account_from_dict(creds)
 
-def polite_sleep():
-    if REQUEST_SLEEP > 0:
-        time.sleep(REQUEST_SLEEP)
-
-# -------- Polygon v3 tickers (correct pagination + filters) --------
-def fetch_all_polygon_tickers_meta():
-    """
-    Return list of dicts with at least: ticker, type, primary_exchange (code).
-    """
-    url = "https://api.polygon.io/v3/reference/tickers"
-    params = {
-        "market": "stocks",
-        "active": "true",
-        "limit": 1000,
-        "apiKey": POLYGON_API_KEY
-    }
-    out = []
-    page = 0
-    while True:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results", [])
-        page += 1
-        print(f"   • Page {page}: {len(results)} tickers")
-        for rec in results:
-            t = rec.get("ticker")
-            typ = (rec.get("type") or "").upper()
-            ex  = (rec.get("primary_exchange") or "").upper()
-            if not t:
-                continue
-            out.append({"ticker": t, "type": typ, "primary_exchange": ex})
-        next_url = data.get("next_url")
-        if not next_url:
-            break
-        # next_url already includes query params; we must append apiKey if not present
-        if "apiKey=" not in next_url:
-            sep = "&" if "?" in next_url else "?"
-            next_url = f"{next_url}{sep}apiKey={POLYGON_API_KEY}"
-        url = next_url
-        params = None  # subsequent pages use absolute next_url
-        polite_sleep()
-    # Filter by allowed exchanges/types here
-    filtered = [m for m in out if m["type"] in ALLOWED_TYPES and m["primary_exchange"] in ALLOWED_EXCHANGES]
-    # Deduplicate
-    seen = set()
-    uniq = []
-    for m in filtered:
-        if m["ticker"] not in seen:
-            seen.add(m["ticker"])
-            uniq.append(m)
-    print(f"📦 Polygon active equities (post-filter): {len(uniq)}")
-    return uniq
-
-def write_tickers_sheet(ws, metas):
-    rows = [[m["ticker"]] for m in metas]
+def write_tickers_sheet(gc, tickers):
+    ws = gc.open(SHEET_NAME).worksheet(TICKERS_TAB)
     ws.clear()
-    ws.update([["Ticker"]] + rows)
-    print(f"✅ Wrote {len(rows)} tickers to '{TICKERS_TAB}'")
+    ws.append_row(["Ticker"])
+    rows = [[t] for t in tickers]
+    for i in range(0, len(rows), 1000):
+        ws.append_rows(rows[i:i+1000], value_input_option="USER_ENTERED")
+    print(f"✅ Wrote {len(tickers)} tickers to '{TICKERS_TAB}'")
 
-# -------- Historical data (daily) --------
-def get_hist_data(ticker, days=250):
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days*2)  # buffer for weekends/holidays
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_dt:%Y-%m-%d}/{end_dt:%Y-%m-%d}"
-    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}
+def write_screener_sheet(gc, rows):
+    ws = gc.open(SHEET_NAME).worksheet(SCREENER_TAB)
+    ws.clear()
+    headers = [
+        "Ticker","Price","EMA_20","SMA_50","SMA_200","RSI_14",
+        "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
+        "AvgVol20","20D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
+    ]
+    ws.append_row(headers)
+    for i in range(0, len(rows), 100):
+        ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
+    print(f"✅ Wrote {len(rows)} rows to '{SCREENER_TAB}'")
+
+# =========================
+# Polygon helpers
+# =========================
+BASE = "https://api.polygon.io"
+
+def polite_sleep():
+    if SLEEP_MS_BETWEEN_CALLS > 0:
+        time.sleep(SLEEP_MS_BETWEEN_CALLS / 1000.0)
+
+def fetch_all_polygon_meta():
+    """All active U.S. equities w/ metadata (type, primary_exchange)."""
+    url = f"{BASE}/v3/reference/tickers"
+    params = {"market":"stocks","active":"true","limit":1000,"apiKey":POLYGON_API_KEY}
+    out, next_url, next_params, page = [], url, params, 0
+    while next_url:
+        r = requests.get(next_url, params=next_params, timeout=30); r.raise_for_status()
+        data = r.json(); results = data.get("results", [])
+        for rec in results:
+            out.append({
+                "ticker": rec.get("ticker"),
+                "type": (rec.get("type") or "").upper(),
+                "primary_exchange": (rec.get("primary_exchange") or "").upper()
+            })
+        page += 1; print(f"   • Meta page {page}: {len(results)}")
+        next_url = data.get("next_url")
+        next_params = {"apiKey": POLYGON_API_KEY} if next_url else None
+        polite_sleep()
+    # unique tickers
+    seen, meta = set(), []
+    for m in out:
+        t = m["ticker"]
+        if t and t not in seen:
+            seen.add(t); meta.append(m)
+    print(f"📦 Polygon active equities (meta): {len(meta)}")
+    return meta
+
+def last_trading_dates_utc(n=5):
+    d = datetime.now(timezone.utc).date() - timedelta(days=1)
+    for _ in range(n):
+        yield d
+        d -= timedelta(days=1)
+
+def fetch_grouped_map():
+    """One grouped-aggregates request (yesterday; fallback up to 5 days)."""
+    for d in last_trading_dates_utc():
+        url = f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{d.isoformat()}"
+        params = {"adjusted":"true","apiKey":POLYGON_API_KEY}
+        try:
+            r = requests.get(url, params=params, timeout=60); r.raise_for_status()
+            res = r.json().get("results", [])
+            if res:
+                m = {}
+                for rec in res:
+                    t = rec.get("T")
+                    if not t: continue
+                    m[t] = {"v": rec.get("v", 0), "c": rec.get("c", 0.0)}
+                print(f"🗂️ Grouped bars date: {d.isoformat()} (tickers: {len(m)})")
+                return m
+        except Exception:
+            pass
+        polite_sleep()
+    print("⚠️ Could not fetch grouped aggregates; prefilter disabled.")
+    return {}
+
+def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
+    """Daily aggregates for a symbol; compute indicators locally."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days*2)  # include weekends/holidays buffer
+    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
     try:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
+        r = requests.get(url, params=params, timeout=30); r.raise_for_status()
         results = r.json().get("results", [])
-        if not results:
-            return None
+        if not results: return None
         df = pd.DataFrame(results)
-        df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-        df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"}, inplace=True)
+        df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
         return df.tail(days).reset_index(drop=True)
     except Exception:
         return None
     finally:
         polite_sleep()
 
-# -------- Analysis --------
-def analyze_ticker(ticker):
-    df = get_hist_data(ticker, days=250)
-    if df is None or len(df) < 200:
+# =========================
+# Indicators
+# =========================
+def ema(series, window): return series.ewm(span=window, adjust=False).mean()
+def sma(series, window): return series.rolling(window).mean()
+
+def rsi(series, window=14):
+    delta = series.diff()
+    up = delta.clip(lower=0); down = -delta.clip(upper=0)
+    ru = up.ewm(alpha=1/window, adjust=False).mean()
+    rd = down.ewm(alpha=1/window, adjust=False).mean().replace(0, np.nan)
+    rs = ru / rd
+    return 100 - (100 / (1 + rs))
+
+def macd(series, fast=12, slow=26, signal=9):
+    ef = ema(series, fast); es = ema(series, slow)
+    line = ef - es; sig = ema(line, signal)
+    hist = line - sig
+    return line, sig, hist
+
+# =========================
+# Analysis
+# =========================
+def analyze_one(ticker):
+    df = fetch_daily_bars_df(ticker, DAYS_LOOKBACK)
+    if df is None or df.shape[0] < 200:
+        return None  # need enough bars for SMA200
+
+    # Latest bar must have volume
+    if "volume" not in df.columns or float(df["volume"].iloc[-1]) <= 0:
         return None
 
-    # Basic liquidity & price checks
-    price = float(df["Close"].iloc[-1])
-    if price < MIN_PRICE:
-        return None
-    avg_vol20 = float(df["Volume"].tail(20).mean())
-    if avg_vol20 < MIN_DAILY_VOL:
-        return None
-    if float(df["Volume"].iloc[-1]) <= 0:
-        return None
+    close = df["close"].astype(float)
+    vol   = df["volume"].astype(float)
 
-    # Indicators (ta)
-    ema20_series = EMAIndicator(df["Close"], window=20).ema_indicator()
-    sma50_series = SMAIndicator(df["Close"], window=50).sma_indicator()
-    sma200_series= SMAIndicator(df["Close"], window=200).sma_indicator()
-    rsi14 = float(RSIIndicator(df["Close"], window=14).rsi().iloc[-1])
-    macd_obj = MACD(df["Close"], window_slow=26, window_fast=12, window_sign=9)
-    macd_line = float(macd_obj.macd().iloc[-1])
-    macd_signal = float(macd_obj.macd_signal().iloc[-1])
-    macd_hist = float(macd_obj.macd_diff().iloc[-1])
+    price  = float(close.iloc[-1])
+    ema20  = float(ema(close, 20).iloc[-1])
+    sma50  = float(sma(close, 50).iloc[-1])
+    sma200 = float(sma(close, 200).iloc[-1])
 
-    ema20 = float(ema20_series.iloc[-1])
-    sma50 = float(sma50_series.iloc[-1])
-    sma200 = float(sma200_series.iloc[-1])
+    rsi14 = float(rsi(close, 14).iloc[-1])
 
-    # Breakout (20D high)
-    high20 = float(df["High"].tail(20).max())
-    is_breakout = price >= high20 - 1e-9
+    macd_line, macd_sig, macd_hist = macd(close, 12, 26, 9)
+    macd_v    = float(macd_line.iloc[-1])
+    signal_v  = float(macd_sig.iloc[-1])
+    hist_v    = float(macd_hist.iloc[-1])
+    hist_prev = float(macd_hist.iloc[-2]) if macd_hist.shape[0] >= 2 else np.nan
+    hist_delta= hist_v - hist_prev if not np.isnan(hist_prev) else np.nan
 
-    # ===== BUY SIGNALS (rolled back MACD: crossover + hist > 0) =====
+    avg_vol20 = float(vol.tail(20).mean())
+    high_20 = float(close.tail(20).max())
+    is_breakout = price >= high_20 - 1e-9
+
+    # ===== stricter BUY signal with two surgical checks =====
+    # 1) Long-term uptrend
     if not (price > ema20 > sma50 > sma200):
         return None
+
+    # Not overextended above EMA20
     if (price / ema20 - 1.0) > MAX_EXT_ABOVE_EMA20_PCT:
         return None
+
+    # RSI band
     if not (RSI_MIN < rsi14 < RSI_MAX):
         return None
-    if not (macd_line > macd_signal and macd_hist > 0):
+
+    # 2) Fresh momentum: new MACD cross today + rising histogram
+    macd_cross_yesterday = (macd_line.iloc[-2] <= macd_sig.iloc[-2])
+    fresh_cross = macd_cross_yesterday and (macd_v > signal_v)
+    if not (fresh_cross and hist_v > 0 and (not np.isnan(hist_delta) and hist_delta > 0)):
         return None
+
+    # Optional breakout requirement
     if REQUIRE_20D_HIGH and not is_breakout:
         return None
 
-    return [
+    buy_reason = (
+        "P>EMA20>SMA50>SMA200, "
+        f"RSI {RSI_MIN}-{RSI_MAX}, "
+        "fresh MACD cross & Hist↑, "
+        f"≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20"
+        + (" + 20D breakout" if REQUIRE_20D_HIGH else "")
+    )
+
+    row = [
         ticker,
         round(price, 2),
         round(ema20, 2),
         round(sma50, 2),
         round(sma200, 2),
         round(rsi14, 2),
-        round(macd_line, 4),
-        round(macd_signal, 4),
-        round(macd_hist, 4),
+        round(macd_v, 4),
+        round(signal_v, 4),
+        round(hist_v, 4),
+        round(hist_delta, 4) if not np.isnan(hist_delta) else "",
         int(avg_vol20),
-        round(high20, 2),
+        round(high_20, 2),
         "✅" if is_breakout else "",
         "✅",
-        "Stricter trend + MACD crossover" + (" + 20D breakout" if REQUIRE_20D_HIGH else ""),
-        datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        buy_reason,
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     ]
+    return row
 
-def write_screener_sheet(ws, rows):
-    headers = [
-        "Ticker","Price","EMA_20","SMA_50","SMA_200","RSI_14",
-        "MACD","Signal","Hist","AvgVol20","20D_High","Breakout",
-        "Bullish Signal","Buy Reason","Timestamp"
-    ]
-    ws.clear()
-    if rows:
-        ws.append_row(headers)
-        # write in batches
-        for i in range(0, len(rows), 200):
-            ws.append_rows(rows[i:i+200], value_input_option="USER_ENTERED")
-    else:
-        ws.append_row(headers)
-    print(f"✅ Wrote {len(rows)} analyzed rows to '{SCREENER_TAB}'")
-
+# =========================
+# Orchestration
+# =========================
 def main():
     print("🚀 Ticker collector + screener starting")
     gc = get_google_client()
-    tickers_ws  = gc.open(SHEET_NAME).worksheet(TICKERS_TAB)
-    screener_ws = gc.open(SHEET_NAME).worksheet(SCREENER_TAB)
 
-    metas = fetch_all_polygon_tickers_meta()  # uses correct exchange/type codes
-    write_tickers_sheet(tickers_ws, metas)
+    # 1) Universe with metadata (always write full list to 'tickers')
+    print("📥 Fetching all active equities (meta) from Polygon…")
+    meta = fetch_all_polygon_meta()
+    all_tickers = sorted({m["ticker"] for m in meta if m["ticker"]})
+    write_tickers_sheet(gc, all_tickers)
 
-    tickers = [m["ticker"] for m in metas][:MAX_TICKERS]
-    print(f"🧪 Analyzing {len(tickers)} tickers (MAX_TICKERS={MAX_TICKERS})…")
+    # 2) Prefilter with ONE grouped request + metadata
+    grouped = fetch_grouped_map()
+    filtered = []
+    for m in meta:
+        t = m["ticker"]; typ = m["type"]; ex = m["primary_exchange"]
+        if not t or not typ or not ex:
+            continue
+        if typ in EXCLUDE_TYPES or typ not in INCLUDE_TYPES:
+            continue
+        if ex not in ALLOWED_EXCHANGES:
+            continue
+        g = grouped.get(t)
+        if not g:
+            continue
+        if (g["v"] or 0) < MIN_DAILY_VOL:
+            continue
+        if (g["c"] or 0.0) < MIN_PRICE:
+            continue
+        filtered.append(t)
+
+    filtered = sorted(set(filtered))
+    print(f"🎯 Prefiltered universe: {len(filtered)} tickers")
+
+    # 3) Analyze capped subset
+    subset = filtered[:MAX_TICKERS]
+    print(f"🧪 Analyzing {len(subset)} tickers (MAX_TICKERS={MAX_TICKERS})…")
     rows = []
-    for i, t in enumerate(tickers, 1):
-        res = analyze_ticker(t)
-        if res:
-            rows.append(res)
+    for i, t in enumerate(subset, 1):
+        r = analyze_one(t)
+        if r:
+            rows.append(r)
         if i % 50 == 0:
-            print(f"   • analyzed {i}/{len(tickers)}")
+            print(f"   • analyzed {i}/{len(subset)}")
 
-    write_screener_sheet(screener_ws, rows)
+    # 4) Write (no ranking; buy everything that passes)
+    write_screener_sheet(gc, rows)
+    print("✅ Screener update complete")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("❌ Fatal error:", e)
+        traceback.print_exc()
