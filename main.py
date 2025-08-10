@@ -72,28 +72,37 @@ def fetch_all_tickers():
     next_url = url
     page = 1
     while next_url:
-        resp = requests.get(next_url, params=params if page == 1 else None)
+        resp = requests.get(next_url, params=params if page == 1 else None, timeout=30)
+        resp.raise_for_status()
         data = resp.json()
-        batch = [t["ticker"] for t in data.get("results", []) if t.get("primary_exchange") in ("NYSE", "NASDAQ", "AMEX")]
+        # FIX: don't filter by primary_exchange human names; take all here
+        batch = [t["ticker"] for t in data.get("results", []) if "ticker" in t]
         tickers.extend(batch)
         print(f"   • Page {page}: {len(batch)} tickers")
         next_url = data.get("next_url")
         if next_url:
-            next_url += f"&apiKey={POLYGON_API_KEY}"
+            # include apiKey on subsequent pages
+            joiner = "&" if "?" in next_url else "?"
+            next_url = f"{next_url}{joiner}apiKey={POLYGON_API_KEY}"
         page += 1
+        time.sleep(REQUEST_SLEEP)
     print(f"📦 Polygon active equities: {len(tickers)}")
     return tickers
 
 def fetch_daily_bars_df(ticker, days):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{(datetime.now(timezone.utc) - pd.Timedelta(days=days*2)).strftime('%Y-%m-%d')}/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    start = (datetime.now(timezone.utc) - pd.Timedelta(days=days*2)).strftime("%Y-%m-%d")
+    end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
     params = {"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": POLYGON_API_KEY}
     try:
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
         data = resp.json()
-        if "results" not in data:
+        results = data.get("results", [])
+        if not results:
             return None
-        df = pd.DataFrame(data["results"])
-        df["t"] = pd.to_datetime(df["t"], unit="ms")
+        df = pd.DataFrame(results)
+        df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
         df.rename(columns={"c": "close", "v": "volume"}, inplace=True)
         return df
     except Exception:
@@ -121,9 +130,9 @@ def analyze_one(ticker):
 
     # MORE EXCLUSIVE CRITERIA
     is_bullish = (
-        (40 < rsi14 < 60) and         # tighter RSI range
+        (40 < rsi14 < 60) and          # tighter RSI range
         (macd_v > signal_v * 1.01) and # MACD clearly above signal
-        (price > ema20 * 1.01)        # price 1% above EMA20
+        (price > ema20 * 1.01)         # price 1% above EMA20
     )
 
     rank_score = 0.0
@@ -160,11 +169,12 @@ def main():
     ws_tickers = gc.open(SHEET_NAME).worksheet(TICKERS_TAB)
     ws_tickers.clear()
     ws_tickers.append_row(["Ticker"])
-    ws_tickers.append_rows([[t] for t in tickers], value_input_option="USER_ENTERED")
+    if tickers:
+        ws_tickers.append_rows([[t] for t in tickers], value_input_option="USER_ENTERED")
     print(f"✅ Wrote {len(tickers)} tickers to '{TICKERS_TAB}'")
 
     # Analyze
-    print(f"🧪 Analyzing {len(tickers)} tickers (MAX_TICKERS={MAX_TICKERS})…")
+    print(f"🧪 Analyzing {min(len(tickers), MAX_TICKERS)} tickers (MAX_TICKERS={MAX_TICKERS})…")
     rows = []
     for i, t in enumerate(tickers[:MAX_TICKERS], 1):
         row = analyze_one(t)
