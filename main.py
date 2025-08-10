@@ -27,15 +27,18 @@ INCLUDE_TYPES = set(os.getenv("INCLUDE_TYPES", "CS,ADRC,ADRP,ADRR").split(",")) 
 EXCLUDE_TYPES = set(os.getenv("EXCLUDE_TYPES", "ETF,ETN,FUND,SP,PFD,WRT,RIGHT,UNIT,REIT").split(","))
 
 # Analysis caps & pacing
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))     # analyze at most this many
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))
 DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "200"))
 SLEEP_MS_BETWEEN_CALLS = int(os.getenv("SLEEP_MS_BETWEEN_CALLS", "50"))
 
-# Stricter BUY criteria (tuned tighter than before)
+# BUY criteria (existing defaults)
 RSI_MIN = float(os.getenv("RSI_MIN", "52"))
 RSI_MAX = float(os.getenv("RSI_MAX", "60"))
 MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.05"))  # 5% cap
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
+
+# NEW: minimum MACD histogram rise required to consider "fresh momentum"
+MIN_HIST_DELTA = float(os.getenv("MIN_HIST_DELTA", "0.05"))
 
 # =========================
 # Google Sheets helpers
@@ -57,7 +60,7 @@ def write_screener_sheet(gc, rows):
     ws = gc.open(SHEET_NAME).worksheet(SCREENER_TAB)
     ws.clear()
     headers = [
-        "Ticker","Price","EMA_20","SMA_50","RSI_14",
+        "Ticker","Price","EMA_20","SMA_50","SMA_200","RSI_14",
         "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
         "AvgVol20","20D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
     ]
@@ -173,8 +176,8 @@ def macd(series, fast=12, slow=26, signal=9):
 # =========================
 def analyze_one(ticker):
     df = fetch_daily_bars_df(ticker, DAYS_LOOKBACK)
-    if df is None or df.shape[0] < 60:
-        return None
+    if df is None or df.shape[0] < 200:
+        return None  # need enough bars for SMA200
 
     # Latest bar must have volume
     if "volume" not in df.columns or float(df["volume"].iloc[-1]) <= 0:
@@ -183,9 +186,11 @@ def analyze_one(ticker):
     close = df["close"].astype(float)
     vol   = df["volume"].astype(float)
 
-    price = float(close.iloc[-1])
-    ema20 = float(ema(close, 20).iloc[-1])
-    sma50 = float(sma(close, 50).iloc[-1])
+    price  = float(close.iloc[-1])
+    ema20  = float(ema(close, 20).iloc[-1])
+    sma50  = float(sma(close, 50).iloc[-1])
+    sma200 = float(sma(close, 200).iloc[-1])
+
     rsi14 = float(rsi(close, 14).iloc[-1])
 
     macd_line, macd_sig, macd_hist = macd(close, 12, 26, 9)
@@ -199,25 +204,34 @@ def analyze_one(ticker):
     high_20 = float(close.tail(20).max())
     is_breakout = price >= high_20 - 1e-9
 
-    # ===== stricter BUY signal (no Avg$Vol requirement) =====
-    # Trend & not overextended
-    if not (price > ema20 > sma50):
+    # ===== stricter BUY signal with fresh MACD and min histogram rise =====
+    # 1) Long-term uptrend
+    if not (price > ema20 > sma50 > sma200):
         return None
+
+    # Not overextended above EMA20
     if (price / ema20 - 1.0) > MAX_EXT_ABOVE_EMA20_PCT:
         return None
+
     # RSI band
     if not (RSI_MIN < rsi14 < RSI_MAX):
         return None
-    # MACD quality (above signal and rising histogram)
-    if not (macd_v > signal_v and hist_v > 0 and (not np.isnan(hist_delta) and hist_delta > 0)):
+
+    # 2) Fresh momentum: new MACD cross today + rising histogram with minimum delta
+    macd_cross_yesterday = (macd_line.iloc[-2] <= macd_sig.iloc[-2])
+    fresh_cross = macd_cross_yesterday and (macd_v > signal_v)
+    if not (fresh_cross and hist_v > 0 and (not np.isnan(hist_delta)) and hist_delta > MIN_HIST_DELTA):
         return None
+
     # Optional breakout requirement
     if REQUIRE_20D_HIGH and not is_breakout:
         return None
 
     buy_reason = (
-        f"Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
-        f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20"
+        "P>EMA20>SMA50>SMA200, "
+        f"RSI {RSI_MIN}-{RSI_MAX}, "
+        f"fresh MACD cross & Hist↑ (Δ≥{MIN_HIST_DELTA}), "
+        f"≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20"
         + (" + 20D breakout" if REQUIRE_20D_HIGH else "")
     )
 
@@ -226,6 +240,7 @@ def analyze_one(ticker):
         round(price, 2),
         round(ema20, 2),
         round(sma50, 2),
+        round(sma200, 2),
         round(rsi14, 2),
         round(macd_v, 4),
         round(signal_v, 4),
@@ -286,6 +301,7 @@ def main():
             rows.append(r)
         if i % 50 == 0:
             print(f"   • analyzed {i}/{len(subset)}")
+
     # 4) Write (no ranking; buy everything that passes)
     write_screener_sheet(gc, rows)
     print("✅ Screener update complete")
