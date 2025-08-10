@@ -31,11 +31,11 @@ MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))     # analyze at most this ma
 DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "200"))
 SLEEP_MS_BETWEEN_CALLS = int(os.getenv("SLEEP_MS_BETWEEN_CALLS", "50"))
 
-# Stricter BUY criteria
-RSI_MIN = float(os.getenv("RSI_MIN", "50"))
-RSI_MAX = float(os.getenv("RSI_MAX", "62"))
-MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.08"))  # 8% cap above EMA20
-MIN_AVG_DOLLAR_VOL_20 = float(os.getenv("MIN_AVG_DOLLAR_VOL_20", "10000000"))  # $10M
+# Stricter BUY criteria (tuned tighter than before)
+RSI_MIN = float(os.getenv("RSI_MIN", "52"))
+RSI_MAX = float(os.getenv("RSI_MAX", "60"))
+MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.05"))  # 5% cap
+REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
 
 # =========================
 # Google Sheets helpers
@@ -59,7 +59,7 @@ def write_screener_sheet(gc, rows):
     headers = [
         "Ticker","Price","EMA_20","SMA_50","RSI_14",
         "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
-        "AvgVol20","Avg$Vol20","Bullish Signal","Buy Reason","Timestamp"
+        "AvgVol20","20D_High","Breakout","Bullish Signal","Buy Reason","Timestamp"
     ]
     ws.append_row(headers)
     for i in range(0, len(rows), 100):
@@ -109,10 +109,7 @@ def last_trading_dates_utc(n=5):
         d -= timedelta(days=1)
 
 def fetch_grouped_map():
-    """
-    One grouped-aggregates request (yesterday; fallback up to 5 days) to prefilter by volume & price.
-    Returns dict: { 'AAPL': {'v': volume, 'c': close}, ... }
-    """
+    """One grouped-aggregates request (yesterday; fallback up to 5 days)."""
     for d in last_trading_dates_utc():
         url = f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{d.isoformat()}"
         params = {"adjusted":"true","apiKey":POLYGON_API_KEY}
@@ -199,12 +196,10 @@ def analyze_one(ticker):
     hist_delta= hist_v - hist_prev if not np.isnan(hist_prev) else np.nan
 
     avg_vol20 = float(vol.tail(20).mean())
-    avg_dollar_vol20 = float((vol.tail(20) * close.tail(20)).mean())
+    high_20 = float(close.tail(20).max())
+    is_breakout = price >= high_20 - 1e-9
 
-    # ===== stricter BUY signal =====
-    # Liquidity
-    if avg_dollar_vol20 < MIN_AVG_DOLLAR_VOL_20:
-        return None
+    # ===== stricter BUY signal (no Avg$Vol requirement) =====
     # Trend & not overextended
     if not (price > ema20 > sma50):
         return None
@@ -216,11 +211,14 @@ def analyze_one(ticker):
     # MACD quality (above signal and rising histogram)
     if not (macd_v > signal_v and hist_v > 0 and (not np.isnan(hist_delta) and hist_delta > 0)):
         return None
+    # Optional breakout requirement
+    if REQUIRE_20D_HIGH and not is_breakout:
+        return None
 
     buy_reason = (
         f"Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
-        f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20, "
-        f"Avg$Vol20≥{int(MIN_AVG_DOLLAR_VOL_20):,}"
+        f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20"
+        + (" + 20D breakout" if REQUIRE_20D_HIGH else "")
     )
 
     row = [
@@ -234,7 +232,8 @@ def analyze_one(ticker):
         round(hist_v, 4),
         round(hist_delta, 4) if not np.isnan(hist_delta) else "",
         int(avg_vol20),
-        int(avg_dollar_vol20),
+        round(high_20, 2),
+        "✅" if is_breakout else "",
         "✅",
         buy_reason,
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
