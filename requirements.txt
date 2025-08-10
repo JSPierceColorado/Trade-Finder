@@ -1,5 +1,6 @@
-gspread==6.0.0
-google-auth==2.29.0
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
+pandas
+numpy
+requests
+gspread
+oauth2client
+ta
