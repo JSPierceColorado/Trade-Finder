@@ -20,21 +20,23 @@ if not POLYGON_API_KEY:
     raise RuntimeError("Missing POLYGON_API_KEY env var.")
 
 # Prefilter knobs (cheap, via grouped bars + metadata)
-MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "300000"))         # yesterday's raw shares
+MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "300000"))         # yesterday's raw shares (used only if grouped data present)
 MIN_PRICE     = float(os.getenv("MIN_PRICE", "2.0"))
 ALLOWED_EXCHANGES = set(os.getenv("ALLOWED_EXCHANGES", "XNYS,XNAS,XASE,ARCX,BATS").split(","))
 INCLUDE_TYPES = set(os.getenv("INCLUDE_TYPES", "CS,ADRC,ADRP,ADRR").split(","))  # common & ADRs
 EXCLUDE_TYPES = set(os.getenv("EXCLUDE_TYPES", "ETF,ETN,FUND,SP,PFD,WRT,RIGHT,UNIT,REIT").split(","))
 
 # Analysis caps & pacing
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))     # analyze at most this many
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))     # analyze at most this many (after prefilter)
 DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "200"))
 SLEEP_MS_BETWEEN_CALLS = int(os.getenv("SLEEP_MS_BETWEEN_CALLS", "50"))
 
-# Stricter BUY criteria (tuned tighter than before)
-RSI_MIN = float(os.getenv("RSI_MIN", "52"))
-RSI_MAX = float(os.getenv("RSI_MAX", "60"))
-MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.05"))  # 5% cap
+# ---- Buy criteria (wider RSI + dynamic overextension) ----
+RSI_MIN = float(os.getenv("RSI_MIN", "50"))                   # was 52
+RSI_MAX = float(os.getenv("RSI_MAX", "65"))                   # was 60
+MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.08"))  # floor: 8% (was 5%)
+DYNAMIC_EXTENSION = os.getenv("DYNAMIC_EXTENSION", "true").lower() in ("1","true","yes")
+EXT_ATR_MULT = float(os.getenv("EXT_ATR_MULT", "0.5"))        # dynamic cap component: 0.5 * (ATR20/EMA20)
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
 
 # =========================
@@ -127,7 +129,7 @@ def fetch_grouped_map():
         except Exception:
             pass
         polite_sleep()
-    print("⚠️ Could not fetch grouped aggregates; prefilter disabled.")
+    print("⚠️ Could not fetch grouped aggregates; proceeding without grouped prefilter gates.")
     return {}
 
 def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
@@ -168,6 +170,14 @@ def macd(series, fast=12, slow=26, signal=9):
     hist = line - sig
     return line, sig, hist
 
+def atr(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(window=window, min_periods=window).mean()
+
 # =========================
 # Analysis
 # =========================
@@ -184,7 +194,8 @@ def analyze_one(ticker):
     vol   = df["volume"].astype(float)
 
     price = float(close.iloc[-1])
-    ema20 = float(ema(close, 20).iloc[-1])
+    ema20_series = ema(close, 20)
+    ema20 = float(ema20_series.iloc[-1])
     sma50 = float(sma(close, 50).iloc[-1])
     rsi14 = float(rsi(close, 14).iloc[-1])
 
@@ -199,11 +210,18 @@ def analyze_one(ticker):
     high_20 = float(close.tail(20).max())
     is_breakout = price >= high_20 - 1e-9
 
-    # ===== stricter BUY signal (no Avg$Vol requirement) =====
+    # Dynamic overextension cap via ATR20
+    allowed_ext = MAX_EXT_ABOVE_EMA20_PCT
+    if DYNAMIC_EXTENSION:
+        atr20_series = atr(df, window=20)
+        if not atr20_series.isna().iloc[-1] and ema20 > 0:
+            allowed_ext = max(allowed_ext, EXT_ATR_MULT * float(atr20_series.iloc[-1]) / ema20)
+
+    # ===== BUY signal =====
     # Trend & not overextended
     if not (price > ema20 > sma50):
         return None
-    if (price / ema20 - 1.0) > MAX_EXT_ABOVE_EMA20_PCT:
+    if (price / max(1e-12, ema20) - 1.0) > allowed_ext:
         return None
     # RSI band
     if not (RSI_MIN < rsi14 < RSI_MAX):
@@ -217,7 +235,7 @@ def analyze_one(ticker):
 
     buy_reason = (
         f"Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
-        f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_ABOVE_EMA20_PCT*100)}% above EMA20"
+        f"MACD>Signal & Hist↑, ≤{int(allowed_ext*100)}% allowed above EMA20"
         + (" + 20D breakout" if REQUIRE_20D_HIGH else "")
     )
 
@@ -255,28 +273,33 @@ def main():
 
     # 2) Prefilter with ONE grouped request + metadata
     grouped = fetch_grouped_map()
+    use_grouped = bool(grouped)  # ← only enforce grouped-based gates if we actually have data
+
     filtered = []
     for m in meta:
-        t = m["ticker"]; typ = m["type"]; ex = m["primary_exchange"]
+        t = m["ticker"]; typ = (m["type"] or "").upper(); ex = (m["primary_exchange"] or "").upper()
         if not t or not typ or not ex:
             continue
         if typ in EXCLUDE_TYPES or typ not in INCLUDE_TYPES:
             continue
         if ex not in ALLOWED_EXCHANGES:
             continue
-        g = grouped.get(t)
-        if not g:
-            continue
-        if (g["v"] or 0) < MIN_DAILY_VOL:
-            continue
-        if (g["c"] or 0.0) < MIN_PRICE:
-            continue
+
+        if use_grouped:
+            g = grouped.get(t)
+            if not g:
+                continue
+            if (g.get("v") or 0) < MIN_DAILY_VOL:
+                continue
+            if (g.get("c") or 0.0) < MIN_PRICE:
+                continue
+        # If grouped unavailable, skip yesterday-only vol/price gates; let the analyzer decide.
         filtered.append(t)
 
     filtered = sorted(set(filtered))
-    print(f"🎯 Prefiltered universe: {len(filtered)} tickers")
+    print(f"🎯 Prefiltered universe: {len(filtered)} tickers (grouped={'on' if use_grouped else 'off'})")
 
-    # 3) Analyze capped subset
+    # 3) Analyze capped subset (still alphabetical; consider sorting by liquidity if you like)
     subset = filtered[:MAX_TICKERS]
     print(f"🧪 Analyzing {len(subset)} tickers (MAX_TICKERS={MAX_TICKERS})…")
     rows = []
