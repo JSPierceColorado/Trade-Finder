@@ -1,19 +1,23 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# System deps (pandas needs these)
+# Minimal OS deps (certs only)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libatlas-base-dev \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Make sure we get binary wheels
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-CMD ["python", "main.py"]
+CMD ["python","-u","main.py"]
