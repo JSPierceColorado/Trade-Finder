@@ -39,6 +39,16 @@ DYNAMIC_EXTENSION = os.getenv("DYNAMIC_EXTENSION", "true").lower() in ("1","true
 EXT_ATR_MULT = float(os.getenv("EXT_ATR_MULT", "0.5"))        # dynamic cap component: 0.5 * (ATR20/EMA20)
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
 
+# ---- NEW: Market RSI gate (any timeframe) ----
+# Only write screener rows if the market RSI is BELOW this threshold
+MARKET_RSI_GATE_ON   = os.getenv("MARKET_RSI_GATE_ON", "1").lower() in ("1","true","yes")
+MARKET_RSI_TICKER    = os.getenv("MARKET_RSI_TICKER", "SPY")    # e.g., SPY, QQQ, IWM
+MARKET_RSI_LEN       = int(os.getenv("MARKET_RSI_LEN", "14"))
+MARKET_RSI_THRESH    = float(os.getenv("MARKET_RSI_THRESH", "35"))  # write only if RSI < 35
+MARKET_RSI_MULTIPLIER= int(os.getenv("MARKET_RSI_MULTIPLIER", "1")) # e.g., 4 with 'hour' → 4-hour RSI
+MARKET_RSI_TIMESPAN  = os.getenv("MARKET_RSI_TIMESPAN", "day").lower()  # minute|hour|day|week|month
+MARKET_RSI_BARS      = int(os.getenv("MARKET_RSI_BARS", "200"))  # bars to fetch for RSI calc
+
 # =========================
 # Google Sheets helpers
 # =========================
@@ -150,6 +160,47 @@ def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
     finally:
         polite_sleep()
 
+# ---- NEW: generic bars for any timeframe (minute/hour/day/week/month) ----
+def fetch_bars_any_tf(ticker: str, multiplier: int, timespan: str, bars: int):
+    """
+    Fetch Polygon aggregates for arbitrary timeframe.
+    timespan ∈ {"minute","hour","day","week","month"}
+    Returns DataFrame with columns: close, high, low, open, volume, timestamp
+    """
+    timespan = timespan.lower()
+    now = datetime.now(timezone.utc)
+    # generous buffer to ensure we get enough bars
+    if timespan == "minute":
+        start = now - timedelta(minutes=multiplier * bars * 2)
+    elif timespan == "hour":
+        start = now - timedelta(hours=multiplier * bars * 2)
+    elif timespan == "day":
+        start = now - timedelta(days=bars * 2)
+    elif timespan == "week":
+        start = now - timedelta(weeks=bars * 2)
+    elif timespan == "month":
+        # approximate months as 30 days
+        start = now - timedelta(days=bars * 2 * 30)
+    else:
+        raise ValueError("MARKET_RSI_TIMESPAN must be minute|hour|day|week|month")
+
+    start_s = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_s   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_s}/{end_s}"
+    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=30); r.raise_for_status()
+        results = r.json().get("results", [])
+        if not results:
+            return None
+        df = pd.DataFrame(results)
+        df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
+        return df.tail(bars).reset_index(drop=True)
+    except Exception:
+        return None
+    finally:
+        polite_sleep()
+
 # =========================
 # Indicators
 # =========================
@@ -177,6 +228,20 @@ def atr(df: pd.DataFrame, window: int = 20) -> pd.Series:
     prev_c = c.shift(1)
     tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(window=window, min_periods=window).mean()
+
+# ---- NEW: market RSI helper ----
+def fetch_market_rsi() -> float:
+    """
+    Returns the latest RSI value for the configured market ticker & timeframe.
+    RSI is computed on 'close' with window MARKET_RSI_LEN.
+    """
+    bars_needed = max(MARKET_RSI_BARS, MARKET_RSI_LEN + 10)
+    df = fetch_bars_any_tf(MARKET_RSI_TICKER, MARKET_RSI_MULTIPLIER, MARKET_RSI_TIMESPAN, bars_needed)
+    if df is None or df.shape[0] < (MARKET_RSI_LEN + 2):
+        return float("nan")
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    r = rsi(close, MARKET_RSI_LEN)
+    return float(r.iloc[-1])
 
 # =========================
 # Analysis
@@ -309,6 +374,29 @@ def main():
             rows.append(r)
         if i % 50 == 0:
             print(f"   • analyzed {i}/{len(subset)}")
+
+    # ---- NEW: Market RSI gate before writing ----
+    if MARKET_RSI_GATE_ON:
+        try:
+            mkt_rsi = fetch_market_rsi()
+            tf = f"{MARKET_RSI_MULTIPLIER} {MARKET_RSI_TIMESPAN}"
+            if not (isinstance(mkt_rsi, (int, float)) and not math.isnan(mkt_rsi)):
+                print(f"⛔ Market RSI gate: unavailable for {MARKET_RSI_TICKER} ({tf}) — writing 0 picks.")
+                write_screener_sheet(gc, [])
+                print("✅ Screener update complete")
+                return
+            if mkt_rsi >= MARKET_RSI_THRESH:
+                print(f"⛔ Market RSI gate: {MARKET_RSI_TICKER} RSI{MARKET_RSI_LEN} ({tf}) = {mkt_rsi:.2f} ≥ {MARKET_RSI_THRESH:.2f} — writing 0 picks.")
+                write_screener_sheet(gc, [])
+                print("✅ Screener update complete")
+                return
+            print(f"✅ Market RSI gate passed: {MARKET_RSI_TICKER} RSI{MARKET_RSI_LEN} ({tf}) = {mkt_rsi:.2f} < {MARKET_RSI_THRESH:.2f} — writing {len(rows)} picks.")
+        except Exception as e:
+            print(f"⛔ Market RSI gate error: {e} — writing 0 picks this run.")
+            write_screener_sheet(gc, [])
+            print("✅ Screener update complete")
+            return
+
     # 4) Write (no ranking; buy everything that passes)
     write_screener_sheet(gc, rows)
     print("✅ Screener update complete")
