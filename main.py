@@ -39,15 +39,17 @@ DYNAMIC_EXTENSION = os.getenv("DYNAMIC_EXTENSION", "true").lower() in ("1","true
 EXT_ATR_MULT = float(os.getenv("EXT_ATR_MULT", "0.5"))        # dynamic cap component: 0.5 * (ATR20/EMA20)
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
 
-# ---- NEW: Market RSI gate (any timeframe) ----
+# ---- Market RSI gate (any timeframe) ----
 # Only write screener rows if the market RSI is BELOW this threshold
-MARKET_RSI_GATE_ON   = os.getenv("MARKET_RSI_GATE_ON", "1").lower() in ("1","true","yes")
-MARKET_RSI_TICKER    = os.getenv("MARKET_RSI_TICKER", "SPY")    # e.g., SPY, QQQ, IWM
-MARKET_RSI_LEN       = int(os.getenv("MARKET_RSI_LEN", "14"))
-MARKET_RSI_THRESH    = float(os.getenv("MARKET_RSI_THRESH", "35"))  # write only if RSI < 35
-MARKET_RSI_MULTIPLIER= int(os.getenv("MARKET_RSI_MULTIPLIER", "1")) # e.g., 4 with 'hour' → 4-hour RSI
-MARKET_RSI_TIMESPAN  = os.getenv("MARKET_RSI_TIMESPAN", "day").lower()  # minute|hour|day|week|month
-MARKET_RSI_BARS      = int(os.getenv("MARKET_RSI_BARS", "200"))  # bars to fetch for RSI calc
+MARKET_RSI_GATE_ON      = os.getenv("MARKET_RSI_GATE_ON", "1").lower() in ("1","true","yes")
+MARKET_RSI_TICKER       = os.getenv("MARKET_RSI_TICKER", "SPY")    # e.g., SPY, QQQ, IWM
+MARKET_RSI_LEN          = int(os.getenv("MARKET_RSI_LEN", "14"))
+MARKET_RSI_THRESH       = float(os.getenv("MARKET_RSI_THRESH", "35"))  # write only if RSI < 35
+MARKET_RSI_MULTIPLIER   = int(os.getenv("MARKET_RSI_MULTIPLIER", "1")) # e.g., 4 with 'hour' → 4-hour RSI
+MARKET_RSI_TIMESPAN     = os.getenv("MARKET_RSI_TIMESPAN", "day").lower()  # minute|hour|day|week|month
+MARKET_RSI_BARS         = int(os.getenv("MARKET_RSI_BARS", "200"))  # bars to fetch for RSI calc
+# NEW: allow robust fallback to daily bars if configured timeframe is sparse
+MARKET_RSI_ALLOW_DAILY_FALLBACK = os.getenv("MARKET_RSI_ALLOW_DAILY_FALLBACK", "1").lower() in ("1","true","yes")
 
 # =========================
 # Google Sheets helpers
@@ -147,7 +149,7 @@ def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days*2)  # include weekends/holidays buffer
     url = f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
-    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
+    params = {"adjusted":"true","sort":"asc","limit":50000","apiKey":POLYGON_API_KEY}
     try:
         r = requests.get(url, params=params, timeout=30); r.raise_for_status()
         results = r.json().get("results", [])
@@ -160,7 +162,7 @@ def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
     finally:
         polite_sleep()
 
-# ---- NEW: generic bars for any timeframe (minute/hour/day/week/month) ----
+# ---- generic bars for any timeframe (minute/hour/day/week/month) ----
 def fetch_bars_any_tf(ticker: str, multiplier: int, timespan: str, bars: int):
     """
     Fetch Polygon aggregates for arbitrary timeframe.
@@ -168,25 +170,25 @@ def fetch_bars_any_tf(ticker: str, multiplier: int, timespan: str, bars: int):
     Returns DataFrame with columns: close, high, low, open, volume, timestamp
     """
     timespan = timespan.lower()
+    mult = max(1, int(multiplier))
     now = datetime.now(timezone.utc)
-    # generous buffer to ensure we get enough bars
+    # generous buffer (×3) to ensure we get enough bars
     if timespan == "minute":
-        start = now - timedelta(minutes=multiplier * bars * 2)
+        start = now - timedelta(minutes=mult * bars * 3)
     elif timespan == "hour":
-        start = now - timedelta(hours=multiplier * bars * 2)
+        start = now - timedelta(hours=mult * bars * 3)
     elif timespan == "day":
-        start = now - timedelta(days=bars * 2)
+        start = now - timedelta(days=bars * 3)
     elif timespan == "week":
-        start = now - timedelta(weeks=bars * 2)
+        start = now - timedelta(weeks=bars * 3)
     elif timespan == "month":
-        # approximate months as 30 days
-        start = now - timedelta(days=bars * 2 * 30)
+        start = now - timedelta(days=bars * 3 * 30)  # approx months
     else:
         raise ValueError("MARKET_RSI_TIMESPAN must be minute|hour|day|week|month")
 
     start_s = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_s   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_s}/{end_s}"
+    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/{mult}/{timespan}/{start_s}/{end_s}"
     params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
     try:
         r = requests.get(url, params=params, timeout=30); r.raise_for_status()
@@ -195,6 +197,7 @@ def fetch_bars_any_tf(ticker: str, multiplier: int, timespan: str, bars: int):
             return None
         df = pd.DataFrame(results)
         df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
+        # keep only the last <bars> rows
         return df.tail(bars).reset_index(drop=True)
     except Exception:
         return None
@@ -229,19 +232,33 @@ def atr(df: pd.DataFrame, window: int = 20) -> pd.Series:
     tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(window=window, min_periods=window).mean()
 
-# ---- NEW: market RSI helper ----
+# ---- market RSI helper (with daily fallback) ----
 def fetch_market_rsi() -> float:
     """
-    Returns the latest RSI value for the configured market ticker & timeframe.
-    RSI is computed on 'close' with window MARKET_RSI_LEN.
+    Returns latest RSI for the configured market ticker & timeframe.
+    Falls back to daily bars if the configured timeframe is sparse (optional).
     """
-    bars_needed = max(MARKET_RSI_BARS, MARKET_RSI_LEN + 10)
+    bars_needed = max(MARKET_RSI_BARS, MARKET_RSI_LEN + 20)
+
+    # Try configured timeframe first
     df = fetch_bars_any_tf(MARKET_RSI_TICKER, MARKET_RSI_MULTIPLIER, MARKET_RSI_TIMESPAN, bars_needed)
+    source = f"{MARKET_RSI_MULTIPLIER} {MARKET_RSI_TIMESPAN}"
+
+    # Fallback: daily bars (more reliable) if configured TF is sparse
+    if (df is None or df.shape[0] < (MARKET_RSI_LEN + 2)) and MARKET_RSI_ALLOW_DAILY_FALLBACK:
+        df = fetch_daily_bars_df(MARKET_RSI_TICKER, days=max(DAYS_LOOKBACK, MARKET_RSI_LEN + 50))
+        source = "daily_fallback"
+
     if df is None or df.shape[0] < (MARKET_RSI_LEN + 2):
+        have = 0 if df is None else df.shape[0]
+        print(f"⚠️ Market RSI: insufficient bars for {MARKET_RSI_TICKER} (source={source}) have={have} need≥{MARKET_RSI_LEN + 2}")
         return float("nan")
+
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     r = rsi(close, MARKET_RSI_LEN)
-    return float(r.iloc[-1])
+    val = float(r.iloc[-1])
+    print(f"ℹ️ Market RSI source={source} value={val:.2f}")
+    return val
 
 # =========================
 # Analysis
@@ -375,7 +392,7 @@ def main():
         if i % 50 == 0:
             print(f"   • analyzed {i}/{len(subset)}")
 
-    # ---- NEW: Market RSI gate before writing ----
+    # ---- Market RSI gate before writing ----
     if MARKET_RSI_GATE_ON:
         try:
             mkt_rsi = fetch_market_rsi()
