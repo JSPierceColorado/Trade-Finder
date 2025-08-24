@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import requests
 import gspread
 import pandas as pd
@@ -20,36 +19,24 @@ if not POLYGON_API_KEY:
     raise RuntimeError("Missing POLYGON_API_KEY env var.")
 
 # Prefilter knobs (cheap, via grouped bars + metadata)
-MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "300000"))         # yesterday's raw shares (used only if grouped data present)
+MIN_DAILY_VOL = int(os.getenv("MIN_DAILY_VOL", "300000"))
 MIN_PRICE     = float(os.getenv("MIN_PRICE", "2.0"))
 ALLOWED_EXCHANGES = set(os.getenv("ALLOWED_EXCHANGES", "XNYS,XNAS,XASE,ARCX,BATS").split(","))
-INCLUDE_TYPES = set(os.getenv("INCLUDE_TYPES", "CS,ADRC,ADRP,ADRR").split(","))  # common & ADRs
+INCLUDE_TYPES = set(os.getenv("INCLUDE_TYPES", "CS,ADRC,ADRP,ADRR").split(","))
 EXCLUDE_TYPES = set(os.getenv("EXCLUDE_TYPES", "ETF,ETN,FUND,SP,PFD,WRT,RIGHT,UNIT,REIT").split(","))
 
 # Analysis caps & pacing
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))     # analyze at most this many (after prefilter)
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "800"))
 DAYS_LOOKBACK = int(os.getenv("DAYS_LOOKBACK", "200"))
 SLEEP_MS_BETWEEN_CALLS = int(os.getenv("SLEEP_MS_BETWEEN_CALLS", "50"))
 
-# ---- Buy criteria (wider RSI + dynamic overextension) ----
-RSI_MIN = float(os.getenv("RSI_MIN", "50"))                   # was 52
-RSI_MAX = float(os.getenv("RSI_MAX", "65"))                   # was 60
-MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.08"))  # floor: 8% (was 5%)
+# ---- Buy criteria ----
+RSI_MIN = float(os.getenv("RSI_MIN", "50"))
+RSI_MAX = float(os.getenv("RSI_MAX", "65"))
+MAX_EXT_ABOVE_EMA20_PCT = float(os.getenv("MAX_EXT_ABOVE_EMA20_PCT", "0.08"))
 DYNAMIC_EXTENSION = os.getenv("DYNAMIC_EXTENSION", "true").lower() in ("1","true","yes")
-EXT_ATR_MULT = float(os.getenv("EXT_ATR_MULT", "0.5"))        # dynamic cap component: 0.5 * (ATR20/EMA20)
+EXT_ATR_MULT = float(os.getenv("EXT_ATR_MULT", "0.5"))
 REQUIRE_20D_HIGH = os.getenv("REQUIRE_20D_HIGH", "true").lower() in ("1","true","yes")
-
-# ---- Market RSI gate (any timeframe) ----
-# Only write screener rows if the market RSI is BELOW this threshold
-MARKET_RSI_GATE_ON      = os.getenv("MARKET_RSI_GATE_ON", "1").lower() in ("1","true","yes")
-MARKET_RSI_TICKER       = os.getenv("MARKET_RSI_TICKER", "SPY")    # e.g., SPY, QQQ, IWM
-MARKET_RSI_LEN          = int(os.getenv("MARKET_RSI_LEN", "14"))
-MARKET_RSI_THRESH       = float(os.getenv("MARKET_RSI_THRESH", "35"))  # write only if RSI < 35
-MARKET_RSI_MULTIPLIER   = int(os.getenv("MARKET_RSI_MULTIPLIER", "1")) # e.g., 4 with 'hour' → 4-hour RSI
-MARKET_RSI_TIMESPAN     = os.getenv("MARKET_RSI_TIMESPAN", "day").lower()  # minute|hour|day|week|month
-MARKET_RSI_BARS         = int(os.getenv("MARKET_RSI_BARS", "200"))  # bars to fetch for RSI calc
-# NEW: allow robust fallback to daily bars if configured timeframe is sparse
-MARKET_RSI_ALLOW_DAILY_FALLBACK = os.getenv("MARKET_RSI_ALLOW_DAILY_FALLBACK", "1").lower() in ("1","true","yes")
 
 # =========================
 # Google Sheets helpers
@@ -90,7 +77,6 @@ def polite_sleep():
         time.sleep(SLEEP_MS_BETWEEN_CALLS / 1000.0)
 
 def fetch_all_polygon_meta():
-    """All active U.S. equities w/ metadata (type, primary_exchange)."""
     url = f"{BASE}/v3/reference/tickers"
     params = {"market":"stocks","active":"true","limit":1000,"apiKey":POLYGON_API_KEY}
     out, next_url, next_params, page = [], url, params, 0
@@ -107,7 +93,6 @@ def fetch_all_polygon_meta():
         next_url = data.get("next_url")
         next_params = {"apiKey": POLYGON_API_KEY} if next_url else None
         polite_sleep()
-    # unique tickers
     seen, meta = set(), []
     for m in out:
         t = m["ticker"]
@@ -123,7 +108,6 @@ def last_trading_dates_utc(n=5):
         d -= timedelta(days=1)
 
 def fetch_grouped_map():
-    """One grouped-aggregates request (yesterday; fallback up to 5 days)."""
     for d in last_trading_dates_utc():
         url = f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{d.isoformat()}"
         params = {"adjusted":"true","apiKey":POLYGON_API_KEY}
@@ -145,11 +129,10 @@ def fetch_grouped_map():
     return {}
 
 def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
-    """Daily aggregates for a symbol; compute indicators locally."""
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days*2)  # include weekends/holidays buffer
+    start = end - timedelta(days=days*2)
     url = f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
-    params = {"adjusted":"true","sort":"asc","limit":50000","apiKey":POLYGON_API_KEY}
+    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
     try:
         r = requests.get(url, params=params, timeout=30); r.raise_for_status()
         results = r.json().get("results", [])
@@ -157,48 +140,6 @@ def fetch_daily_bars_df(ticker, days=DAYS_LOOKBACK):
         df = pd.DataFrame(results)
         df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
         return df.tail(days).reset_index(drop=True)
-    except Exception:
-        return None
-    finally:
-        polite_sleep()
-
-# ---- generic bars for any timeframe (minute/hour/day/week/month) ----
-def fetch_bars_any_tf(ticker: str, multiplier: int, timespan: str, bars: int):
-    """
-    Fetch Polygon aggregates for arbitrary timeframe.
-    timespan ∈ {"minute","hour","day","week","month"}
-    Returns DataFrame with columns: close, high, low, open, volume, timestamp
-    """
-    timespan = timespan.lower()
-    mult = max(1, int(multiplier))
-    now = datetime.now(timezone.utc)
-    # generous buffer (×3) to ensure we get enough bars
-    if timespan == "minute":
-        start = now - timedelta(minutes=mult * bars * 3)
-    elif timespan == "hour":
-        start = now - timedelta(hours=mult * bars * 3)
-    elif timespan == "day":
-        start = now - timedelta(days=bars * 3)
-    elif timespan == "week":
-        start = now - timedelta(weeks=bars * 3)
-    elif timespan == "month":
-        start = now - timedelta(days=bars * 3 * 30)  # approx months
-    else:
-        raise ValueError("MARKET_RSI_TIMESPAN must be minute|hour|day|week|month")
-
-    start_s = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_s   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/{mult}/{timespan}/{start_s}/{end_s}"
-    params = {"adjusted":"true","sort":"asc","limit":50000,"apiKey":POLYGON_API_KEY}
-    try:
-        r = requests.get(url, params=params, timeout=30); r.raise_for_status()
-        results = r.json().get("results", [])
-        if not results:
-            return None
-        df = pd.DataFrame(results)
-        df.rename(columns={"c":"close","o":"open","h":"high","l":"low","v":"volume","t":"timestamp"}, inplace=True)
-        # keep only the last <bars> rows
-        return df.tail(bars).reset_index(drop=True)
     except Exception:
         return None
     finally:
@@ -232,34 +173,6 @@ def atr(df: pd.DataFrame, window: int = 20) -> pd.Series:
     tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(window=window, min_periods=window).mean()
 
-# ---- market RSI helper (with daily fallback) ----
-def fetch_market_rsi() -> float:
-    """
-    Returns latest RSI for the configured market ticker & timeframe.
-    Falls back to daily bars if the configured timeframe is sparse (optional).
-    """
-    bars_needed = max(MARKET_RSI_BARS, MARKET_RSI_LEN + 20)
-
-    # Try configured timeframe first
-    df = fetch_bars_any_tf(MARKET_RSI_TICKER, MARKET_RSI_MULTIPLIER, MARKET_RSI_TIMESPAN, bars_needed)
-    source = f"{MARKET_RSI_MULTIPLIER} {MARKET_RSI_TIMESPAN}"
-
-    # Fallback: daily bars (more reliable) if configured TF is sparse
-    if (df is None or df.shape[0] < (MARKET_RSI_LEN + 2)) and MARKET_RSI_ALLOW_DAILY_FALLBACK:
-        df = fetch_daily_bars_df(MARKET_RSI_TICKER, days=max(DAYS_LOOKBACK, MARKET_RSI_LEN + 50))
-        source = "daily_fallback"
-
-    if df is None or df.shape[0] < (MARKET_RSI_LEN + 2):
-        have = 0 if df is None else df.shape[0]
-        print(f"⚠️ Market RSI: insufficient bars for {MARKET_RSI_TICKER} (source={source}) have={have} need≥{MARKET_RSI_LEN + 2}")
-        return float("nan")
-
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    r = rsi(close, MARKET_RSI_LEN)
-    val = float(r.iloc[-1])
-    print(f"ℹ️ Market RSI source={source} value={val:.2f}")
-    return val
-
 # =========================
 # Analysis
 # =========================
@@ -268,7 +181,6 @@ def analyze_one(ticker):
     if df is None or df.shape[0] < 60:
         return None
 
-    # Latest bar must have volume
     if "volume" not in df.columns or float(df["volume"].iloc[-1]) <= 0:
         return None
 
@@ -292,26 +204,20 @@ def analyze_one(ticker):
     high_20 = float(close.tail(20).max())
     is_breakout = price >= high_20 - 1e-9
 
-    # Dynamic overextension cap via ATR20
     allowed_ext = MAX_EXT_ABOVE_EMA20_PCT
     if DYNAMIC_EXTENSION:
         atr20_series = atr(df, window=20)
         if not atr20_series.isna().iloc[-1] and ema20 > 0:
             allowed_ext = max(allowed_ext, EXT_ATR_MULT * float(atr20_series.iloc[-1]) / ema20)
 
-    # ===== BUY signal =====
-    # Trend & not overextended
     if not (price > ema20 > sma50):
         return None
     if (price / max(1e-12, ema20) - 1.0) > allowed_ext:
         return None
-    # RSI band
     if not (RSI_MIN < rsi14 < RSI_MAX):
         return None
-    # MACD quality (above signal and rising histogram)
     if not (macd_v > signal_v and hist_v > 0 and (not np.isnan(hist_delta) and hist_delta > 0)):
         return None
-    # Optional breakout requirement
     if REQUIRE_20D_HIGH and not is_breakout:
         return None
 
@@ -347,15 +253,13 @@ def main():
     print("🚀 Ticker collector + screener starting")
     gc = get_google_client()
 
-    # 1) Universe with metadata (always write full list to 'tickers')
     print("📥 Fetching all active equities (meta) from Polygon…")
     meta = fetch_all_polygon_meta()
     all_tickers = sorted({m["ticker"] for m in meta if m["ticker"]})
     write_tickers_sheet(gc, all_tickers)
 
-    # 2) Prefilter with ONE grouped request + metadata
     grouped = fetch_grouped_map()
-    use_grouped = bool(grouped)  # ← only enforce grouped-based gates if we actually have data
+    use_grouped = bool(grouped)
 
     filtered = []
     for m in meta:
@@ -366,7 +270,6 @@ def main():
             continue
         if ex not in ALLOWED_EXCHANGES:
             continue
-
         if use_grouped:
             g = grouped.get(t)
             if not g:
@@ -375,13 +278,11 @@ def main():
                 continue
             if (g.get("c") or 0.0) < MIN_PRICE:
                 continue
-        # If grouped unavailable, skip yesterday-only vol/price gates; let the analyzer decide.
         filtered.append(t)
 
     filtered = sorted(set(filtered))
     print(f"🎯 Prefiltered universe: {len(filtered)} tickers (grouped={'on' if use_grouped else 'off'})")
 
-    # 3) Analyze capped subset (still alphabetical; consider sorting by liquidity if you like)
     subset = filtered[:MAX_TICKERS]
     print(f"🧪 Analyzing {len(subset)} tickers (MAX_TICKERS={MAX_TICKERS})…")
     rows = []
@@ -392,29 +293,6 @@ def main():
         if i % 50 == 0:
             print(f"   • analyzed {i}/{len(subset)}")
 
-    # ---- Market RSI gate before writing ----
-    if MARKET_RSI_GATE_ON:
-        try:
-            mkt_rsi = fetch_market_rsi()
-            tf = f"{MARKET_RSI_MULTIPLIER} {MARKET_RSI_TIMESPAN}"
-            if not (isinstance(mkt_rsi, (int, float)) and not math.isnan(mkt_rsi)):
-                print(f"⛔ Market RSI gate: unavailable for {MARKET_RSI_TICKER} ({tf}) — writing 0 picks.")
-                write_screener_sheet(gc, [])
-                print("✅ Screener update complete")
-                return
-            if mkt_rsi >= MARKET_RSI_THRESH:
-                print(f"⛔ Market RSI gate: {MARKET_RSI_TICKER} RSI{MARKET_RSI_LEN} ({tf}) = {mkt_rsi:.2f} ≥ {MARKET_RSI_THRESH:.2f} — writing 0 picks.")
-                write_screener_sheet(gc, [])
-                print("✅ Screener update complete")
-                return
-            print(f"✅ Market RSI gate passed: {MARKET_RSI_TICKER} RSI{MARKET_RSI_LEN} ({tf}) = {mkt_rsi:.2f} < {MARKET_RSI_THRESH:.2f} — writing {len(rows)} picks.")
-        except Exception as e:
-            print(f"⛔ Market RSI gate error: {e} — writing 0 picks this run.")
-            write_screener_sheet(gc, [])
-            print("✅ Screener update complete")
-            return
-
-    # 4) Write (no ranking; buy everything that passes)
     write_screener_sheet(gc, rows)
     print("✅ Screener update complete")
 
